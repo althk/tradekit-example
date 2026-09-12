@@ -1,0 +1,5 @@
+# tradekit has no tagged releases yet, so install straight from the sibling
+# checkout in editable mode. Once it's on PyPI or a tagged git ref, swap this
+# for a pinned requirement (or `pip install "tradekit[upstox] @ git+https://github.com/althk/tradekit.git#subdirectory=py"`).
+-e ../../tradekit/py[upstox]
+python-dotenv>=1.0
