@@ -1,8 +1,6 @@
 package main
 
 import (
-	"fmt"
-
 	"github.com/althk/tradekit/go/core/money"
 	"github.com/althk/tradekit/go/harness"
 
@@ -20,7 +18,7 @@ type config struct {
 	APIKey    string         `env:"KITE_API_KEY" validate:"required"`
 	APISecret harness.Secret `env:"KITE_API_SECRET" validate:"required"`
 	// RedirectURL is the redirect registered on the Kite Connect app; the
-	// login callback server listens on its port and path. See login.go.
+	// login callback server listens on its port and path. See main.go.
 	RedirectURL string `env:"KITE_REDIRECT_URL"`
 
 	Exchange     string  `env:"SYMBOL_EXCHANGE"`
@@ -33,14 +31,10 @@ type config struct {
 	DBPath       string  `env:"DB_PATH"`
 	ReportPath   string  `env:"REPORT_PATH"`
 
-	// money.Money fields aren't something harness.Overlay's env parsing can
-	// take directly (it reads them as a bare int64, i.e. paise, not
-	// "2000.00"), so these two are read as decimal strings and parsed below.
-	DailyLossLimitRaw string `env:"DAILY_LOSS_LIMIT"`
-	BacktestCashRaw   string `env:"BACKTEST_CASH"`
-
-	dailyLossCap money.Money
-	backtestCash money.Money
+	// money.Money fields read a decimal string ("2000.00"); Overlay parses
+	// them through money.Parse, so bare paise are never mistaken for rupees.
+	DailyLossLimit money.Money `env:"DAILY_LOSS_LIMIT"`
+	BacktestCash   money.Money `env:"BACKTEST_CASH"`
 }
 
 func loadConfig() (config, error) {
@@ -48,39 +42,23 @@ func loadConfig() (config, error) {
 	_ = godotenv.Load()
 
 	cfg := config{
-		Mode:              "live",
-		RedirectURL:       "http://127.0.0.1:9880/kite/callback",
-		Exchange:          "NSE",
-		Symbol:            "RELIANCE",
-		FastPeriod:        20,
-		SlowPeriod:        50,
-		StopPct:           0.03,
-		RiskFraction:      0.01,
-		MaxTrades:         3,
-		DBPath:            "bot.db",
-		ReportPath:        "report.html",
-		DailyLossLimitRaw: "2000.00",
-		BacktestCashRaw:   "1000000.00",
+		Mode:           "live",
+		RedirectURL:    "http://127.0.0.1:9880/kite/callback",
+		Exchange:       "NSE",
+		Symbol:         "RELIANCE",
+		FastPeriod:     20,
+		SlowPeriod:     50,
+		StopPct:        0.03,
+		RiskFraction:   0.01,
+		MaxTrades:      3,
+		DBPath:         "bot.db",
+		ReportPath:     "report.html",
+		DailyLossLimit: money.MustParse("2000.00"),
+		BacktestCash:   money.MustParse("1000000.00"),
 	}
 
 	// Overlay applies every `env:"..."` tag on top of the defaults above and
 	// fails with every missing `validate:"required"` field named at once,
 	// rather than one at a time across repeated restarts.
-	if err := harness.Overlay(&cfg); err != nil {
-		return cfg, err
-	}
-
-	dailyLossCap, err := money.Parse(cfg.DailyLossLimitRaw)
-	if err != nil {
-		return cfg, fmt.Errorf("DAILY_LOSS_LIMIT: %w", err)
-	}
-	cfg.dailyLossCap = dailyLossCap
-
-	backtestCash, err := money.Parse(cfg.BacktestCashRaw)
-	if err != nil {
-		return cfg, fmt.Errorf("BACKTEST_CASH: %w", err)
-	}
-	cfg.backtestCash = backtestCash
-
-	return cfg, nil
+	return cfg, harness.Overlay(&cfg)
 }

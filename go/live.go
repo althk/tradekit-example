@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/althk/tradekit/go/core/costs"
 	"github.com/althk/tradekit/go/core/domain"
 	"github.com/althk/tradekit/go/core/indicators"
 	"github.com/althk/tradekit/go/core/risk"
@@ -15,8 +14,13 @@ import (
 	"github.com/althk/tradekit/go/zerodha"
 )
 
+// riskStateKey is where the day's risk counters live in the store, so a
+// second run on the same day still knows how many trades the first made.
+const riskStateKey = "risk_daily_state"
+
 // runLive checks for a crossover on the latest candle and, if one just
-// happened, places a real order.
+// happened, places a real order. The whole thing is bracketed in a store
+// run, so the runs table shows every invocation and how it ended.
 func runLive(
 	ctx context.Context,
 	cfg config,
@@ -25,43 +29,47 @@ func runLive(
 	key domain.InstrumentKey,
 	candles []domain.Candle,
 ) error {
+	return db.WithRun(ctx, "live", strategyName, nil, func(ctx context.Context, runID int64) error {
+		return decide(ctx, cfg, client, db, key, candles, runID)
+	})
+}
+
+func decide(
+	ctx context.Context,
+	cfg config,
+	client *zerodha.Client,
+	db *store.DB,
+	key domain.InstrumentKey,
+	candles []domain.Candle,
+	runID int64,
+) error {
 	journal := &harness.Journal{DB: db}
 	// Discard sends nothing anywhere; swap in harness.NewTelegram(cfg.TelegramToken,
 	// cfg.ChatID) to get paged on entries, exits and risk refusals instead.
 	var notifier harness.Notifier = harness.Discard{}
-
-	runID, err := db.StartRun(ctx, "live", strategyName, nil)
-	if err != nil {
-		return fmt.Errorf("start run: %w", err)
-	}
 
 	closes := indicators.Closes(candles)
 	fast := indicators.SMA(closes, cfg.FastPeriod)
 	slow := indicators.SMA(closes, cfg.SlowPeriod)
 
 	last := len(candles) - 1
-	prev := last - 1
-	if !indicators.IsValid(fast[prev]) || !indicators.IsValid(slow[prev]) ||
-		!indicators.IsValid(fast[last]) || !indicators.IsValid(slow[last]) {
+	goldenCross, deathCross, ok := crossover(fast, slow, last)
+	if !ok {
 		slog.Info("indicators still warming up, nothing to do")
-		return db.FinishRun(ctx, runID, "ok", "warming up")
+		return nil
 	}
-
-	goldenCross := fast[prev] <= slow[prev] && fast[last] > slow[last]
-	deathCross := fast[prev] >= slow[prev] && fast[last] < slow[last]
 
 	positions, err := client.Positions(ctx)
 	if err != nil {
-		_ = db.FinishRun(ctx, runID, "error", err.Error())
 		return fmt.Errorf("fetch positions: %w", err)
 	}
-	held := heldQuantity(positions, key)
+	held := domain.HeldQuantity(positions, key)
 
 	switch {
 	case deathCross && held > 0:
-		err = handleExit(ctx, client, db, journal, notifier, key, held, candles[last], runID)
+		return handleExit(ctx, client, db, journal, notifier, key, held, candles[last], runID)
 	case goldenCross && held == 0:
-		err = handleEntry(ctx, client, db, journal, notifier, cfg, key, candles[last], runID)
+		return handleEntry(ctx, client, db, journal, notifier, cfg, key, candles[last], runID)
 	default:
 		reason := "no crossover"
 		if held > 0 {
@@ -69,17 +77,11 @@ func runLive(
 		}
 		slog.Info("no action", harness.Key(key), harness.Reason(reason),
 			"fast_sma", fast[last], "slow_sma", slow[last], "held", held)
-		err = journal.Record(ctx, harness.Decision{
+		return journal.Record(ctx, harness.Decision{
 			RunID: runID, At: time.Now(), Key: key, Action: "skip", Reason: reason,
 			Detail: map[string]any{"fast_sma": fast[last], "slow_sma": slow[last], "held": held},
 		})
 	}
-	if err != nil {
-		_ = db.FinishRun(ctx, runID, "error", err.Error())
-		return err
-	}
-
-	return db.FinishRun(ctx, runID, "ok", "")
 }
 
 // handleEntry sizes and places a golden-cross buy. The stop is a plain
@@ -104,11 +106,16 @@ func handleEntry(
 		Price: entry, Stop: stop, Strategy: strategyName,
 	}
 
-	state := risk.NewDailyState(time.Now().Format("2006-01-02"))
+	// The day's counters come from the store: each run is one process, and
+	// MaxTradesPerDay means nothing if every process starts from zero.
+	state, err := db.LoadDailyState(ctx, riskStateKey, time.Now().Format("2006-01-02"))
+	if err != nil {
+		return err
+	}
 	tracker := risk.NewTracker(state)
 	chain := risk.Chain{
 		risk.KillSwitch{},
-		risk.DailyLossLimit{Limit: cfg.dailyLossCap},
+		risk.DailyLossLimit{Limit: cfg.DailyLossLimit},
 		risk.MaxTradesPerDay{Max: cfg.MaxTrades},
 	}
 	if err := chain.Check(ctx, sig, tracker.Snapshot()); err != nil {
@@ -147,21 +154,15 @@ func handleEntry(
 		return fmt.Errorf("place order: %w", err)
 	}
 	tracker.RecordTrade(key)
-
-	if _, err := db.InsertSignal(ctx, sig, runID, false); err != nil {
-		slog.Warn("record signal", "err", err)
+	// Neither write is fatal: the order is already at the broker, and the
+	// next run reconciles from there. What's lost is a row, not money.
+	if err := db.SaveDailyState(ctx, riskStateKey, tracker.Snapshot()); err != nil {
+		slog.Warn("save risk state", "err", err)
 	}
-	if err := db.UpsertOrder(ctx, order, false); err != nil {
-		slog.Warn("record order", "err", err)
+	if _, err := db.RecordFill(ctx, sig, order, runID, false); err != nil {
+		slog.Warn("record fill", "err", err)
 	}
-
-	charges, err := costs.Compute(chargeTable("zerodha"), costs.Trade{
-		Broker: "zerodha", Segment: costs.EquityDelivery, Quantity: sizeResult.Quantity,
-		EntryPrice: entry, ExitPrice: entry, EntryAt: time.Now(), ExitAt: time.Now(), Buying: true,
-	})
-	if err == nil {
-		slog.Info("estimated entry charges", harness.Money("total", charges.Total))
-	}
+	estimatedCharges("entry", sizeResult.Quantity, entry, true)
 
 	slog.Info("entered position", harness.Key(key), harness.Side(domain.Buy), harness.Qty(sizeResult.Quantity),
 		harness.Money("entry", entry), harness.Money("stop", stop), "order_id", order.ID)
@@ -196,21 +197,10 @@ func handleExit(
 	if err != nil {
 		return fmt.Errorf("place exit order: %w", err)
 	}
-
-	if _, err := db.InsertSignal(ctx, sig, runID, false); err != nil {
-		slog.Warn("record signal", "err", err)
+	if _, err := db.RecordFill(ctx, sig, order, runID, false); err != nil {
+		slog.Warn("record fill", "err", err)
 	}
-	if err := db.UpsertOrder(ctx, order, false); err != nil {
-		slog.Warn("record order", "err", err)
-	}
-
-	charges, err := costs.Compute(chargeTable("zerodha"), costs.Trade{
-		Broker: "zerodha", Segment: costs.EquityDelivery, Quantity: held,
-		EntryPrice: last.Close, ExitPrice: last.Close, EntryAt: time.Now(), ExitAt: time.Now(), Buying: false,
-	})
-	if err == nil {
-		slog.Info("estimated exit charges", harness.Money("total", charges.Total))
-	}
+	estimatedCharges("exit", held, last.Close, false)
 
 	slog.Info("exited position", harness.Key(key), harness.Side(domain.Sell), harness.Qty(held), "order_id", order.ID)
 	notifier.Notify(ctx, harness.Info, fmt.Sprintf("exited %s qty=%d", key, held))

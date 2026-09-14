@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 
 	"github.com/althk/tradekit/go/backtest"
 	"github.com/althk/tradekit/go/core/costs"
@@ -34,7 +33,7 @@ func runBacktest(
 	candles []domain.Candle,
 ) error {
 	broker := paper.New(paper.Options{
-		Cash:    cfg.backtestCash,
+		Cash:    cfg.BacktestCash,
 		Broker:  "zerodha",
 		Segment: costs.EquityDelivery,
 		Charges: chargeTable("zerodha"),
@@ -55,18 +54,16 @@ func runBacktest(
 		i++
 		snap.Observe(c) // after the broker has already applied this bar
 
-		if i == 0 || !indicators.IsValid(fast[i-1]) || !indicators.IsValid(slow[i-1]) ||
-			!indicators.IsValid(fast[i]) || !indicators.IsValid(slow[i]) {
+		goldenCross, deathCross, ok := crossover(fast, slow, i)
+		if !ok {
 			return nil
 		}
-		goldenCross := fast[i-1] <= slow[i-1] && fast[i] > slow[i]
-		deathCross := fast[i-1] >= slow[i-1] && fast[i] < slow[i]
 
 		positions, err := broker.Positions(ctx)
 		if err != nil {
 			return err
 		}
-		held := heldQuantity(positions, key)
+		held := domain.HeldQuantity(positions, key)
 
 		switch {
 		case deathCross && held > 0:
@@ -87,7 +84,7 @@ func runBacktest(
 		Strategy: strategyName,
 		From:     candles[0].Start,
 		To:       candles[len(candles)-1].Start,
-		Opening:  cfg.backtestCash,
+		Opening:  cfg.BacktestCash,
 		Params: map[string]any{
 			"fast_sma": cfg.FastPeriod, "slow_sma": cfg.SlowPeriod,
 			"stop_pct": cfg.StopPct, "risk_fraction": cfg.RiskFraction,
@@ -99,13 +96,8 @@ func runBacktest(
 		return fmt.Errorf("build report: %w", err)
 	}
 
-	f, err := os.Create(cfg.ReportPath)
-	if err != nil {
-		return fmt.Errorf("create report file: %w", err)
-	}
-	defer f.Close()
-	if err := report.WriteHTML(f); err != nil {
-		return fmt.Errorf("write report: %w", err)
+	if err := report.WriteHTMLFile(cfg.ReportPath); err != nil {
+		return err
 	}
 
 	recorder := &backtest.Recorder{DB: db}
