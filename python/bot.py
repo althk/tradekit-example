@@ -36,12 +36,20 @@ from tradekit.harness import config as harness_config
 from tradekit.harness import obs
 from tradekit.harness.config import Secret
 from tradekit.harness.journal import Decision, Journal
-from tradekit.store import connect
-from tradekit.upstox import UpstoxClient
+from tradekit.harness.login import Callback, browser_login
+from tradekit.store import StateNotFoundError, connect
+from tradekit.upstox import TokenExpiredError, UpstoxClient
 from tradekit.upstox.mapping import instrument_key as build_instrument_key
 
 STRATEGY_NAME = "golden_cross"
 ORDER_TAG = "goldxbot"
+
+# Where the day's access token is kept between runs, in the store's key-value
+# state table.
+SESSION_KEY = "upstox_session"
+# How long a run waits for the browser login; without a bound, a login nobody
+# completes leaves a scheduled run hung.
+LOGIN_TIMEOUT = 300.0
 
 logger = logging.getLogger("goldcross")
 
@@ -57,7 +65,10 @@ class Config:
     """
 
     api_key: str = field(metadata={"env": "UPSTOX_API_KEY"})
-    access_token: Secret = field(metadata={"env": "UPSTOX_ACCESS_TOKEN"})
+    api_secret: Secret = field(metadata={"env": "UPSTOX_API_SECRET"})
+    # The redirect registered on the Upstox app; the login callback server
+    # listens on its port and path. See `login` below.
+    redirect_url: str = field(default="http://127.0.0.1:9880/upstox/callback", metadata={"env": "UPSTOX_REDIRECT_URL"})
     exchange: str = field(default="NSE", metadata={"env": "SYMBOL_EXCHANGE"})
     symbol: str = field(default="RELIANCE", metadata={"env": "SYMBOL"})
     fast_period: int = field(default=20, metadata={"env": "FAST_SMA"})
@@ -106,6 +117,38 @@ class InstrumentResolver:
         if not isin:
             raise RuntimeError(f"no ISIN found for {key}; check SYMBOL / SYMBOL_EXCHANGE")
         return build_instrument_key(key, isin)
+
+
+def login(client: UpstoxClient, db, cfg: Config) -> None:
+    """Make the client usable for today's session.
+
+    The stored token if it is still fresh and Upstox accepts it, otherwise a
+    browser login, persisted for the next run. The token is checked against
+    the broker, not just by date, because a login elsewhere invalidates it
+    without changing its age.
+
+    The browser flow itself -- the callback server on `redirect_url`, the code
+    exchange, the retry page when Upstox reports a refused login -- is
+    `harness.login.browser_login`; `UpstoxClient` satisfies `ports.BrowserLogin`,
+    so this function never sees an authorisation code.
+    """
+    try:
+        saved = db.get_state(SESSION_KEY)
+    except StateNotFoundError:
+        saved = None
+    if saved and saved.get("access_token"):
+        client.set_access_token(saved["access_token"], dt.datetime.fromisoformat(saved["issued_at"]))
+        if client.token_fresh():
+            try:
+                client.account()
+            except TokenExpiredError:
+                logger.info("stored Upstox session is no longer valid; logging in again")
+            else:
+                logger.info("reusing Upstox session issued at %s", saved["issued_at"])
+                return
+
+    token = browser_login(client, Callback(cfg.redirect_url), timeout=LOGIN_TIMEOUT)
+    db.set_state(SESSION_KEY, {"access_token": token, "issued_at": dt.datetime.now(dt.UTC).isoformat()})
 
 
 def held_quantity(positions: list[Position], key: InstrumentKey) -> int:
@@ -291,22 +334,25 @@ def handle_exit(
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_config()
-    # The one line that's safe to print: access_token is a Secret field, so it
+    # The one line that's safe to print: api_secret is a Secret field, so it
     # renders as <redacted> rather than the real value.
     logger.info("config loaded %s", harness_config.redacted(cfg))
+
+    # The store opens first because the day's token lives in it; see `login`.
+    db = connect(cfg.db_path)
+    db.migrate()
 
     resolver = InstrumentResolver()
     client = UpstoxClient(
         api_key=cfg.api_key,
-        access_token=cfg.access_token.reveal(),
-        token_issued_at=dt.datetime.now(dt.UTC),
+        api_secret=cfg.api_secret.reveal(),
+        redirect_uri=cfg.redirect_url,
         instrument_key=resolver,
         tag=ORDER_TAG,
     )
     resolver.client = client
+    login(client, db, cfg)
 
-    db = connect(cfg.db_path)
-    db.migrate()
     journal = Journal(db)
     run_id = db.start_run("live", STRATEGY_NAME, None)
 

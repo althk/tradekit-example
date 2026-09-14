@@ -52,10 +52,12 @@ tradekit has no tagged releases yet, so both examples resolve it from that
 sibling path (`replace` in `go/go.mod`, an editable install in
 `python/requirements.txt`). If your layout differs, edit those paths.
 
-Each example needs its own broker credentials — see `go/.env.example` and
-`python/.env.example`. Neither example implements the login flow that
-produces a daily access token; get one separately (Kite Connect's
-`Login`, Upstox's OAuth flow) and paste it in.
+Each example needs its own broker app credentials and the redirect URL
+registered on that app — see `go/.env.example` and `python/.env.example`.
+The daily access token is obtained through the browser on the first run of
+the day (`harness.BrowserLogin` / `harness.login.browser_login` serve the
+redirect; the adapter exchanges the code) and kept in the SQLite store, so
+later runs that day need no browser.
 
 ## Running
 

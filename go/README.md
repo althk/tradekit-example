@@ -12,12 +12,13 @@ cross. It runs in two modes:
 
 This is **not a strategy worth trading** — there's no confirmation, no
 volatility filter, no partial exits. It exists to show how tradekit's pieces
-fit together, spread across four small files:
+fit together, spread across five small files:
 
 | File | tradekit package | What it does here |
 | --- | --- | --- |
 | `config.go` | `harness` (`Overlay`, `Redacted`) | Env-var config with required-field validation and a startup log line that can't leak a secret |
 | `main.go` | `core/domain`, `core/costs`, `zerodha`, `store` | Wiring: the adapter, the SQLite store, candle fetching, shared helpers |
+| `login.go` | `harness` (`BrowserLogin`), `store` (`GetState`/`SetState`), `zerodha` (`TokenFresh`) | The daily Kite login: reuse the stored token if Kite still accepts it, otherwise the browser flow, then persist |
 | `live.go` | `core/indicators`, `core/risk`, `core/costs`, `store`, `harness` (`Journal`, `Notifier`, `obs`) | The live path: risk gate chain, sizing, order placement, decision journal |
 | `backtest.go` | `core/paper`, `go/backtest`, `core/risk`, `store` | The backtest path: `Replay` drives a paper broker bar by bar, `Snapshotter` marks equity, `Report` renders HTML, `Recorder` saves the run into the same store |
 
@@ -25,7 +26,7 @@ fit together, spread across four small files:
 
 ```sh
 cp .env.example .env
-# fill in KITE_API_KEY, KITE_API_SECRET, KITE_ACCESS_TOKEN
+# fill in KITE_API_KEY, KITE_API_SECRET; KITE_REDIRECT_URL must match the app
 go run .                      # live
 MODE=backtest go run .        # backtest, writes report.html
 ```
@@ -36,11 +37,33 @@ MODE=backtest go run .        # backtest, writes report.html
 at a different path, or at a tagged version once one exists, if that's not
 your layout.
 
-The access token comes from a completed Kite login
-(`kiteconnect.LoginURL` → `Login`), which this example doesn't implement —
-Kite's tokens expire daily, so generate one separately each morning and paste
-it into `.env`. Both modes need it: even the backtest fetches real history
-through the adapter.
+Both modes need a Kite session — even the backtest fetches real history
+through the adapter — and Kite's tokens expire daily, so `login.go` obtains
+one on the first run of the day (see below) and keeps it in the store.
+
+## Login: `harness.BrowserLogin`
+
+Kite issues a token through a browser redirect: the user visits a login URL,
+Kite sends the browser back to the redirect URL registered on the app with a
+single-use `request_token`, and the app exchanges it. `login.go` does the
+part that's specific to this bot and leaves the rest to tradekit:
+
+1. Reads the last session from the store's key-value state (`db.GetState`).
+   If it's from today (`client.TokenFresh`) and Kite still accepts it
+   (`client.Account`), that's the session — a restart mid-day needs no
+   browser. A token that Kite rejects with `zerodha.ErrTokenExpired` is one
+   that a login elsewhere invalidated; anything else is a real error.
+2. Otherwise calls `harness.BrowserLogin(ctx, client, harness.Callback{RedirectURL: ...})`,
+   which binds the port from `KITE_REDIRECT_URL`, logs the login URL, waits
+   for the redirect, has the adapter exchange the token (`zerodha.Client`
+   implements `ports.BrowserLogin`) and returns it. A refused login shows a
+   retry link in the browser and keeps waiting; the context's deadline is
+   what stops a login nobody completes from hanging a scheduled run.
+3. Stores the token with its issue time (`db.SetState`) for the next run.
+
+The redirect URL must match the one registered on the Kite Connect developer
+console character for character; the default, `http://127.0.0.1:9880/kite/callback`,
+is only a suggestion.
 
 ## Config: `harness.Overlay`
 
@@ -52,15 +75,15 @@ the same mechanism `go/harness`'s own tests use:
 type config struct {
     APIKey      string         `env:"KITE_API_KEY" validate:"required"`
     APISecret   harness.Secret `env:"KITE_API_SECRET" validate:"required"`
-    AccessToken harness.Secret `env:"KITE_ACCESS_TOKEN" validate:"required"`
+    RedirectURL string         `env:"KITE_REDIRECT_URL"`
     // ...
 }
 ```
 
-Three missing credentials produce one error naming all three, not three
-restarts. `harness.Redacted(&cfg)` is logged once at startup and is the only
-line that's safe to print — `APISecret` and `AccessToken` are `harness.Secret`,
-so they render as `<redacted>`.
+Two missing credentials produce one error naming both, not two restarts.
+`harness.Redacted(&cfg)` is logged once at startup and is the only line
+that's safe to print — `APISecret` is a `harness.Secret`, so it renders as
+`<redacted>`.
 
 ## Live mode
 

@@ -17,9 +17,11 @@ import (
 type config struct {
 	Mode string `env:"MODE"` // "live" or "backtest"
 
-	APIKey      string         `env:"KITE_API_KEY" validate:"required"`
-	APISecret   harness.Secret `env:"KITE_API_SECRET" validate:"required"`
-	AccessToken harness.Secret `env:"KITE_ACCESS_TOKEN" validate:"required"`
+	APIKey    string         `env:"KITE_API_KEY" validate:"required"`
+	APISecret harness.Secret `env:"KITE_API_SECRET" validate:"required"`
+	// RedirectURL is the redirect registered on the Kite Connect app; the
+	// login callback server listens on its port and path. See login.go.
+	RedirectURL string `env:"KITE_REDIRECT_URL"`
 
 	Exchange     string  `env:"SYMBOL_EXCHANGE"`
 	Symbol       string  `env:"SYMBOL"`
@@ -47,6 +49,7 @@ func loadConfig() (config, error) {
 
 	cfg := config{
 		Mode:              "live",
+		RedirectURL:       "http://127.0.0.1:9880/kite/callback",
 		Exchange:          "NSE",
 		Symbol:            "RELIANCE",
 		FastPeriod:        20,

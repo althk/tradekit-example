@@ -19,7 +19,8 @@ fit together in a single, readable `bot.py`:
 | Risk | `tradekit.core.risk` | A gate `Chain` (kill switch, daily loss limit, max trades/day) run before every entry, then `size` computes the quantity from the stop distance |
 | Costs | `tradekit.core.costs` | A rough rate card estimates round-trip charges, purely for the log line |
 | Persistence | `tradekit.store` | SQLite: every signal and order is recorded, keyed to a run |
-| Config | `tradekit.harness.config` | `overlay` builds `Config` from env vars + defaults, aggregates every missing required field into one error, `redacted` prints it without leaking `access_token` |
+| Config | `tradekit.harness.config` | `overlay` builds `Config` from env vars + defaults, aggregates every missing required field into one error, `redacted` prints it without leaking `api_secret` |
+| Login | `tradekit.harness.login`, `tradekit.store` state | `browser_login` serves the redirect and has the adapter exchange the code; the token is kept in `kv_state` and reused while `token_fresh` and Upstox still accept it |
 | Observability | `tradekit.harness` | `obs.attrs` renders domain values for logs; `Journal` records *why* the bot did (or skipped) something |
 
 There's no Python equivalent of `go/backtest` here — tradekit's Python package
@@ -38,7 +39,7 @@ source .venv/bin/activate
 
 pip install -r requirements.txt
 cp .env.example .env
-# fill in UPSTOX_API_KEY, UPSTOX_ACCESS_TOKEN
+# fill in UPSTOX_API_KEY, UPSTOX_API_SECRET; UPSTOX_REDIRECT_URL must match the app
 
 python bot.py
 ```
@@ -50,9 +51,24 @@ other on disk. Point the path at wherever your checkout lives, or switch to a
 `git+https://...` requirement once tradekit has tags, if that's not your
 layout.
 
-The access token comes from a completed Upstox login, which this example
-doesn't implement — Upstox's tokens expire daily, so generate one separately
-each morning and paste it into `.env`.
+Upstox's tokens expire daily, so `login()` in `bot.py` obtains one on the
+first run of the day and keeps it in the store:
+
+1. Reads the last session from the store's key-value state (`db.get_state`).
+   If it's from today (`client.token_fresh()`) and Upstox still accepts it
+   (`client.account()`), that's the session — a restart mid-day needs no
+   browser. A `TokenExpiredError` means a login elsewhere invalidated it.
+2. Otherwise calls `browser_login(client, Callback(cfg.redirect_url), timeout=...)`,
+   which binds the port from `UPSTOX_REDIRECT_URL`, logs the login URL,
+   waits for the redirect, has the adapter exchange the code (`UpstoxClient`
+   satisfies `ports.BrowserLogin`) and returns the token. A refused login
+   shows a retry link in the browser and keeps waiting; the timeout is what
+   stops a login nobody completes from hanging a scheduled run.
+3. Stores the token with its issue time (`db.set_state`) for the next run.
+
+The redirect URL must match the one registered on the Upstox developer app
+character for character; the default, `http://127.0.0.1:9880/upstox/callback`,
+is only a suggestion.
 
 ## What happens on a run
 

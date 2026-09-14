@@ -39,17 +39,11 @@ func main() {
 		slog.Error("config", "err", err)
 		os.Exit(1)
 	}
-	// Redacted is the one line that's safe to print: APISecret and
-	// AccessToken are harness.Secret fields, so they show as <redacted>.
+	// Redacted is the one line that's safe to print: APISecret is a
+	// harness.Secret field, so it shows as <redacted>.
 	slog.Info("config loaded", "config", harness.Redacted(&cfg))
 
 	ctx := context.Background()
-
-	client, err := newZerodhaClient(ctx, cfg)
-	if err != nil {
-		slog.Error("zerodha client", "err", err)
-		os.Exit(1)
-	}
 
 	db, err := store.Open("sqlite", cfg.DBPath)
 	if err != nil {
@@ -59,6 +53,17 @@ func main() {
 	defer db.Close()
 	if err := db.Migrate(ctx); err != nil {
 		slog.Error("migrate store", "err", err)
+		os.Exit(1)
+	}
+
+	// The store opens first because the day's token lives in it; see login.go.
+	client, err := newZerodhaClient(ctx, cfg)
+	if err != nil {
+		slog.Error("zerodha client", "err", err)
+		os.Exit(1)
+	}
+	if err := login(ctx, client, db, cfg); err != nil {
+		slog.Error("login", "err", err)
 		os.Exit(1)
 	}
 
@@ -84,7 +89,8 @@ func main() {
 // newZerodhaClient wires up the adapter with a lazy instrument-token
 // resolver: Kite's historical endpoint needs its own numeric token, which
 // nothing about an exchange+symbol pair reveals, so it's fetched once, on
-// first use, and cached for the process's lifetime.
+// first use, and cached for the process's lifetime. No access token goes in
+// here — login installs one.
 func newZerodhaClient(ctx context.Context, cfg config) (*zerodha.Client, error) {
 	var client *zerodha.Client
 	var tokens map[domain.InstrumentKey]int
@@ -108,8 +114,6 @@ func newZerodhaClient(ctx context.Context, cfg config) (*zerodha.Client, error) 
 	client, err = zerodha.New(zerodha.Options{
 		APIKey:          cfg.APIKey,
 		APISecret:       cfg.APISecret.Reveal(),
-		AccessToken:     cfg.AccessToken.Reveal(),
-		TokenIssuedAt:   time.Now(),
 		InstrumentToken: lookupToken,
 		Tag:             orderTag,
 	})
