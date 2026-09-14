@@ -24,22 +24,20 @@ from tradekit.core.domain import (
     InstrumentKey,
     OrderRequest,
     OrderType,
-    Position,
     Product,
     Side,
     Signal,
     SignalKind,
     Timeframe,
     TimeInForce,
+    held_quantity,
 )
+from tradekit.harness import Callback, Session, ensure_session, obs
 from tradekit.harness import config as harness_config
-from tradekit.harness import obs
 from tradekit.harness.config import Secret
 from tradekit.harness.journal import Decision, Journal
-from tradekit.harness.login import Callback, browser_login
-from tradekit.store import StateNotFoundError, connect
-from tradekit.upstox import TokenExpiredError, UpstoxClient
-from tradekit.upstox.mapping import instrument_key as build_instrument_key
+from tradekit.store import Database, connect_migrated
+from tradekit.upstox import UpstoxClient
 
 STRATEGY_NAME = "golden_cross"
 ORDER_TAG = "goldxbot"
@@ -47,6 +45,9 @@ ORDER_TAG = "goldxbot"
 # Where the day's access token is kept between runs, in the store's key-value
 # state table.
 SESSION_KEY = "upstox_session"
+# Where the day's risk counters live, so a second run on the same day still
+# knows how many trades the first made.
+RISK_STATE_KEY = "risk_daily_state"
 # How long a run waits for the browser login; without a bound, a login nobody
 # completes leaves a scheduled run hung.
 LOGIN_TIMEOUT = 300.0
@@ -67,7 +68,7 @@ class Config:
     api_key: str = field(metadata={"env": "UPSTOX_API_KEY"})
     api_secret: Secret = field(metadata={"env": "UPSTOX_API_SECRET"})
     # The redirect registered on the Upstox app; the login callback server
-    # listens on its port and path. See `login` below.
+    # listens on its port and path. See `main` below.
     redirect_url: str = field(default="http://127.0.0.1:9880/upstox/callback", metadata={"env": "UPSTOX_REDIRECT_URL"})
     exchange: str = field(default="NSE", metadata={"env": "SYMBOL_EXCHANGE"})
     symbol: str = field(default="RELIANCE", metadata={"env": "SYMBOL"})
@@ -77,85 +78,30 @@ class Config:
     risk_fraction: float = field(default=0.01, metadata={"env": "RISK_FRACTION"})
     max_trades_per_day: int = field(default=3, metadata={"env": "MAX_TRADES_PER_DAY"})
     db_path: str = field(default="bot.db", metadata={"env": "DB_PATH"})
-    # money.Money isn't one of harness.config's overlay types (it reads a bare
-    # decimal string, not paise), so this is read as a string and parsed below.
-    daily_loss_limit_raw: str = field(default="2000.00", metadata={"env": "DAILY_LOSS_LIMIT"})
+    # A money.Money field reads a decimal string ("2000.00"); overlay parses
+    # it through money.parse, so bare paise are never mistaken for rupees.
+    daily_loss_limit: money.Money = field(default=money.parse("2000.00"), metadata={"env": "DAILY_LOSS_LIMIT"})
 
 
 def load_config() -> Config:
     load_dotenv()  # fine if .env is missing; real environment variables still work
     try:
-        cfg = harness_config.overlay({}, Config)
+        return harness_config.overlay({}, Config)
     except ValueError as exc:
         raise SystemExit(f"{exc} (see .env.example)") from None
-    # Not a dataclass field: harness.config.overlay() would try to pass it to
-    # Config's constructor, and a plain attribute set afterward is simpler
-    # than an init=False field it would have to special-case around.
-    cfg.daily_loss_limit = money.parse(cfg.daily_loss_limit_raw)
-    return cfg
 
 
-class InstrumentResolver:
-    """Resolves a domain InstrumentKey to Upstox's SEGMENT|ISIN key, lazily.
+def crossover(fast: list[float], slow: list[float], i: int) -> tuple[bool, bool, bool]:
+    """Whether the fast SMA crossed the slow one between bar i-1 and bar i.
 
-    Upstox addresses cash equity by ISIN, which the adapter cannot derive from
-    an exchange and a symbol. The client needs this resolver before it can
-    exist, and the resolver needs the client to fetch the instrument master --
-    so `client` is wired in after construction, on first use.
+    Returns ``(golden, death, ok)``; ``ok`` is false while either average is
+    still warming up, and at ``i == 0`` where there is no previous bar.
     """
-
-    def __init__(self) -> None:
-        self.client: UpstoxClient | None = None
-        self._isin_by_key: dict[InstrumentKey, str] = {}
-
-    def __call__(self, key: InstrumentKey) -> str:
-        if not self._isin_by_key:
-            assert self.client is not None, "InstrumentResolver.client must be set before use"
-            for instrument in self.client.instruments(key.exchange):
-                self._isin_by_key[instrument.key] = instrument.isin
-        isin = self._isin_by_key.get(key)
-        if not isin:
-            raise RuntimeError(f"no ISIN found for {key}; check SYMBOL / SYMBOL_EXCHANGE")
-        return build_instrument_key(key, isin)
-
-
-def login(client: UpstoxClient, db, cfg: Config) -> None:
-    """Make the client usable for today's session.
-
-    The stored token if it is still fresh and Upstox accepts it, otherwise a
-    browser login, persisted for the next run. The token is checked against
-    the broker, not just by date, because a login elsewhere invalidates it
-    without changing its age.
-
-    The browser flow itself -- the callback server on `redirect_url`, the code
-    exchange, the retry page when Upstox reports a refused login -- is
-    `harness.login.browser_login`; `UpstoxClient` satisfies `ports.BrowserLogin`,
-    so this function never sees an authorisation code.
-    """
-    try:
-        saved = db.get_state(SESSION_KEY)
-    except StateNotFoundError:
-        saved = None
-    if saved and saved.get("access_token"):
-        client.set_access_token(saved["access_token"], dt.datetime.fromisoformat(saved["issued_at"]))
-        if client.token_fresh():
-            try:
-                client.account()
-            except TokenExpiredError:
-                logger.info("stored Upstox session is no longer valid; logging in again")
-            else:
-                logger.info("reusing Upstox session issued at %s", saved["issued_at"])
-                return
-
-    token = browser_login(client, Callback(cfg.redirect_url), timeout=LOGIN_TIMEOUT)
-    db.set_state(SESSION_KEY, {"access_token": token, "issued_at": dt.datetime.now(dt.UTC).isoformat()})
-
-
-def held_quantity(positions: list[Position], key: InstrumentKey) -> int:
-    for p in positions:
-        if p.key == key and p.quantity > 0:
-            return p.quantity
-    return 0
+    if i < 1 or not all(indicators.is_valid(v) for v in (fast[i - 1], slow[i - 1], fast[i], slow[i])):
+        return False, False, False
+    golden = fast[i - 1] <= slow[i - 1] and fast[i] > slow[i]
+    death = fast[i - 1] >= slow[i - 1] and fast[i] < slow[i]
+    return golden, death, True
 
 
 def estimate_charges(quantity: int, price: money.Money, buying: bool) -> costs.Charges:
@@ -204,7 +150,7 @@ def estimate_charges(quantity: int, price: money.Money, buying: bool) -> costs.C
 
 def handle_entry(
     client: UpstoxClient,
-    db,
+    db: Database,
     journal: Journal,
     cfg: Config,
     key: InstrumentKey,
@@ -222,7 +168,9 @@ def handle_entry(
 
     sig = Signal(key=key, kind=SignalKind.LONG, at=dt.datetime.now(dt.UTC), price=entry, stop=stop, strategy=STRATEGY_NAME)
 
-    state = risk.DailyState(date=dt.date.today().isoformat())
+    # The day's counters come from the store: each run is one process, and
+    # MaxTradesPerDay means nothing if every process starts from zero.
+    state = db.load_daily_state(RISK_STATE_KEY, dt.date.today().isoformat())
     tracker = risk.Tracker(state)
     chain = risk.Chain(
         risk.KillSwitch(),
@@ -259,9 +207,13 @@ def handle_entry(
         )
     )
     tracker.record_trade(key)
-
-    db.insert_signal(sig, run_id=run_id, paper=False)
-    db.upsert_order(order, paper=False)
+    # Neither write is fatal: the order is already at the broker, and the
+    # next run reconciles from there. What's lost is a row, not money.
+    try:
+        db.save_daily_state(RISK_STATE_KEY, tracker.snapshot())
+        db.record_fill(sig, order, run_id=run_id, paper=False)
+    except Exception:
+        logger.warning("could not record the fill", exc_info=True)
 
     charges = estimate_charges(result.quantity, entry, True)
     logger.info("estimated entry charges total=%s", money.format(charges.total))
@@ -290,7 +242,7 @@ def handle_entry(
 
 def handle_exit(
     client: UpstoxClient,
-    db,
+    db: Database,
     journal: Journal,
     key: InstrumentKey,
     held: int,
@@ -312,8 +264,10 @@ def handle_exit(
         )
     )
 
-    db.insert_signal(sig, run_id=run_id, paper=False)
-    db.upsert_order(order, paper=False)
+    try:
+        db.record_fill(sig, order, run_id=run_id, paper=False)
+    except Exception:
+        logger.warning("could not record the fill", exc_info=True)
 
     charges = estimate_charges(held, last.close, False)
     logger.info("estimated exit charges total=%s", money.format(charges.total))
@@ -338,27 +292,30 @@ def main() -> None:
     # renders as <redacted> rather than the real value.
     logger.info("config loaded %s", harness_config.redacted(cfg))
 
-    # The store opens first because the day's token lives in it; see `login`.
-    db = connect(cfg.db_path)
-    db.migrate()
+    # The store opens first because the day's token lives in it.
+    db = connect_migrated(cfg.db_path)
 
-    resolver = InstrumentResolver()
+    # No access token goes in here -- ensure_session installs one. With no
+    # instrument_key resolver wired, the client downloads Upstox's instrument
+    # master on first use and caches it for the process; a bot with a store
+    # of instruments would wire db.broker_id instead.
     client = UpstoxClient(
         api_key=cfg.api_key,
         api_secret=cfg.api_secret.reveal(),
         redirect_uri=cfg.redirect_url,
-        instrument_key=resolver,
         tag=ORDER_TAG,
     )
-    resolver.client = client
-    login(client, db, cfg)
+    # The stored token if Upstox still accepts it, otherwise the browser flow
+    # on redirect_url, persisted for the next run. The timeout is what stops
+    # a login nobody completes from hanging a scheduled run.
+    ensure_session(client, db, Session(Callback(cfg.redirect_url), key=SESSION_KEY, timeout=LOGIN_TIMEOUT))
 
     journal = Journal(db)
-    run_id = db.start_run("live", STRATEGY_NAME, None)
-
     key = InstrumentKey(cfg.exchange, cfg.symbol)
 
-    try:
+    # Bracketed in a store run, so the runs table shows every invocation and
+    # how it ended.
+    with db.run("live", STRATEGY_NAME) as run_id:
         end = dt.datetime.now(dt.UTC)
         start = end - dt.timedelta(days=400)
         candles = client.candles(key, Timeframe.D1, start, end)
@@ -369,17 +326,13 @@ def main() -> None:
         fast = indicators.sma(closes, cfg.fast_period)
         slow = indicators.sma(closes, cfg.slow_period)
 
-        last, prev = len(candles) - 1, len(candles) - 2
-        if not all(indicators.is_valid(v) for v in (fast[prev], slow[prev], fast[last], slow[last])):
+        last = len(candles) - 1
+        golden_cross, death_cross, ok = crossover(fast, slow, last)
+        if not ok:
             logger.info("indicators still warming up, nothing to do")
-            db.finish_run(run_id, "ok", "warming up")
             return
 
-        golden_cross = fast[prev] <= slow[prev] and fast[last] > slow[last]
-        death_cross = fast[prev] >= slow[prev] and fast[last] < slow[last]
-
-        positions = client.positions()
-        held = held_quantity(positions, key)
+        held = held_quantity(client.positions(), key)
 
         if death_cross and held > 0:
             handle_exit(client, db, journal, key, held, candles[last], run_id)
@@ -401,11 +354,6 @@ def main() -> None:
                     detail={"fast_sma": fast[last], "slow_sma": slow[last], "held": held},
                 )
             )
-    except Exception as exc:
-        db.finish_run(run_id, "error", str(exc))
-        raise
-    else:
-        db.finish_run(run_id, "ok", "")
 
 
 if __name__ == "__main__":

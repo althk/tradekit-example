@@ -16,11 +16,11 @@ fit together in a single, readable `bot.py`:
 | Money | `tradekit.core.money` | Every price and P&L is an `int` of paise; the stop is `money.mul_fraction(entry, 0.97)` |
 | Broker adapter | `tradekit.upstox` | `candles`, `positions`, `account`, `place_order` against the Upstox REST API |
 | Indicators | `tradekit.core.indicators` | `sma` over closes, `is_valid` to skip the warm-up period |
-| Risk | `tradekit.core.risk` | A gate `Chain` (kill switch, daily loss limit, max trades/day) run before every entry, then `size` computes the quantity from the stop distance |
+| Risk | `tradekit.core.risk`, `tradekit.store` | A gate `Chain` (kill switch, daily loss limit, max trades/day) run before every entry over counters the store keeps per day (`load_daily_state`/`save_daily_state`), then `size` computes the quantity from the stop distance |
 | Costs | `tradekit.core.costs` | A rough rate card estimates round-trip charges, purely for the log line |
-| Persistence | `tradekit.store` | SQLite: every signal and order is recorded, keyed to a run |
+| Persistence | `tradekit.store` | SQLite: `connect_migrated` opens it, `db.run(...)` brackets each invocation in a `runs` row, `record_fill` writes each signal and its order in one transaction |
 | Config | `tradekit.harness.config` | `overlay` builds `Config` from env vars + defaults, aggregates every missing required field into one error, `redacted` prints it without leaking `api_secret` |
-| Login | `tradekit.harness.login`, `tradekit.store` state | `browser_login` serves the redirect and has the adapter exchange the code; the token is kept in `kv_state` and reused while `token_fresh` and Upstox still accept it |
+| Login | `tradekit.harness.session` | `ensure_session` reuses the token in `kv_state` while `token_fresh` and Upstox still accept it, otherwise runs `browser_login` and stores the result |
 | Observability | `tradekit.harness` | `obs.attrs` renders domain values for logs; `Journal` records *why* the bot did (or skipped) something |
 
 There's no Python equivalent of `go/backtest` here — tradekit's Python package
@@ -51,20 +51,27 @@ other on disk. Point the path at wherever your checkout lives, or switch to a
 `git+https://...` requirement once tradekit has tags, if that's not your
 layout.
 
-Upstox's tokens expire daily, so `login()` in `bot.py` obtains one on the
-first run of the day and keeps it in the store:
+Upstox's tokens expire daily, so `main()` obtains one on the first run of
+the day and keeps it in the store, in one call:
 
-1. Reads the last session from the store's key-value state (`db.get_state`).
-   If it's from today (`client.token_fresh()`) and Upstox still accepts it
+```python
+ensure_session(client, db, Session(Callback(cfg.redirect_url), key=SESSION_KEY, timeout=LOGIN_TIMEOUT))
+```
+
+which does, in order:
+
+1. Reads the last session from the store's key-value state under `key`. If
+   it's from today (`client.token_fresh()`) and Upstox still accepts it
    (`client.account()`), that's the session — a restart mid-day needs no
-   browser. A `TokenExpiredError` means a login elsewhere invalidated it.
-2. Otherwise calls `browser_login(client, Callback(cfg.redirect_url), timeout=...)`,
-   which binds the port from `UPSTOX_REDIRECT_URL`, logs the login URL,
-   waits for the redirect, has the adapter exchange the code (`UpstoxClient`
-   satisfies `ports.BrowserLogin`) and returns the token. A refused login
-   shows a retry link in the browser and keeps waiting; the timeout is what
-   stops a login nobody completes from hanging a scheduled run.
-3. Stores the token with its issue time (`db.set_state`) for the next run.
+   browser. A `ports.TokenExpiredError` means a login elsewhere invalidated
+   it; anything else is a real error and does not burn a browser login.
+2. Otherwise runs `browser_login`, which binds the port from
+   `UPSTOX_REDIRECT_URL`, logs the login URL, waits for the redirect, has the
+   adapter exchange the code (`UpstoxClient` satisfies `ports.BrowserLogin`)
+   and returns the token. A refused login shows a retry link in the browser
+   and keeps waiting; `timeout` is what stops a login nobody completes from
+   hanging a scheduled run.
+3. Stores the token with its issue time for the next run.
 
 The redirect URL must match the one registered on the Upstox developer app
 character for character; the default, `http://127.0.0.1:9880/upstox/callback`,
@@ -96,7 +103,8 @@ reset by date, not by process) are what make repeated runs behave sensibly.
 - The cost estimate in `estimate_charges` is illustrative, not a real rate
   card — see `tradekit.core.costs`'s module docstring for why tradekit ships
   none.
-- Upstox addresses cash equity by ISIN, not by exchange+symbol.
-  `InstrumentResolver` fetches the instrument master once per run and caches
-  it in memory. A real bot would cache this in the store instead
-  (`Database.set_broker_id` / `broker_id`).
+- Upstox addresses cash equity by ISIN, not by exchange+symbol. With no
+  `instrument_key` resolver passed to `UpstoxClient`, it fetches the
+  instrument master once per run and caches the keys in memory. A real bot
+  would keep them in the store instead (`Database.set_broker_id` /
+  `broker_id`).
