@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/althk/tradekit/go/core/domain"
 	"github.com/althk/tradekit/go/core/indicators"
+	"github.com/althk/tradekit/go/core/ports"
 	"github.com/althk/tradekit/go/core/risk"
 	"github.com/althk/tradekit/go/harness"
 	"github.com/althk/tradekit/go/store"
@@ -150,7 +152,16 @@ func handleEntry(
 		Type: domain.Market, Product: domain.CNC, TimeInForce: domain.Day,
 		Tag: orderTag,
 	})
+	if errors.Is(err, ports.ErrUnknownOutcome) {
+		// The buy may be live at Kite. Count it against today's limit so the
+		// next run cannot blindly buy again.
+		tracker.RecordTrade(key)
+		if err := db.SaveDailyState(ctx, riskStateKey, tracker.Snapshot()); err != nil {
+			slog.Warn("save risk state", "err", err)
+		}
+	}
 	if err != nil {
+		reportUnknownOutcome(ctx, journal, notifier, runID, key, "entry", err)
 		return fmt.Errorf("place order: %w", err)
 	}
 	tracker.RecordTrade(key)
@@ -195,6 +206,7 @@ func handleExit(
 		Tag: orderTag,
 	})
 	if err != nil {
+		reportUnknownOutcome(ctx, journal, notifier, runID, key, "exit", err)
 		return fmt.Errorf("place exit order: %w", err)
 	}
 	if _, err := db.RecordFill(ctx, sig, order, runID, false); err != nil {
@@ -209,4 +221,30 @@ func handleExit(
 		RunID: runID, At: time.Now(), Key: key, Action: "exit", Reason: "death cross",
 		Detail: map[string]any{"qty": held, "order_id": order.ID},
 	})
+}
+
+// reportUnknownOutcome alerts and journals an order whose fate is unknown --
+// a timeout, or a reply that never arrived -- so it is not mistaken for one
+// that safely failed. Retrying it blindly is how a bot buys twice; the Kite
+// order book (look for orderTag) says whether it went through.
+func reportUnknownOutcome(
+	ctx context.Context,
+	journal *harness.Journal,
+	notifier harness.Notifier,
+	runID int64,
+	key domain.InstrumentKey,
+	what string,
+	err error,
+) {
+	if !errors.Is(err, ports.ErrUnknownOutcome) {
+		return
+	}
+	msg := fmt.Sprintf("%s %s order outcome unknown, check the Kite order book before retrying: %v", key, what, err)
+	slog.Error(msg)
+	notifier.Notify(ctx, harness.Alert, msg)
+	if jerr := journal.Record(ctx, harness.Decision{
+		RunID: runID, At: time.Now(), Key: key, Action: what + "_unknown", Reason: err.Error(),
+	}); jerr != nil {
+		slog.Warn("journal", "err", jerr)
+	}
 }
