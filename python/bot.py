@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 
 from tradekit.core import costs, indicators, risk
 from tradekit.core import money
+from tradekit.core.ports import UnknownOutcomeError
 from tradekit.core.domain import (
     Candle,
     InstrumentKey,
@@ -148,6 +149,22 @@ def estimate_charges(quantity: int, price: money.Money, buying: bool) -> costs.C
     )
 
 
+def report_unknown_outcome(journal: Journal, run_id: int, key: InstrumentKey, what: str, exc: Exception) -> None:
+    """Log and journal an order whose fate is unknown.
+
+    A timeout, or a reply that never arrived, is not a safe failure: the order
+    may be live, and retrying it blindly is how a bot buys twice. The Upstox
+    order book (look for ORDER_TAG) says whether it went through.
+    """
+    logger.error("%s %s order outcome unknown, check the Upstox order book before retrying: %s", key, what, exc)
+    try:
+        journal.record(
+            Decision(run_id=run_id, at=dt.datetime.now(dt.UTC), key=key, action=f"{what}_unknown", reason=str(exc))
+        )
+    except Exception:
+        logger.warning("could not journal the unknown outcome", exc_info=True)
+
+
 def handle_entry(
     client: UpstoxClient,
     db: Database,
@@ -195,17 +212,25 @@ def handle_entry(
         )
         return
 
-    order = client.place_order(
-        OrderRequest(
-            key=key,
-            side=Side.BUY,
-            quantity=result.quantity,
-            type=OrderType.MARKET,
-            product=Product.CNC,
-            time_in_force=TimeInForce.DAY,
-            tag=ORDER_TAG,
+    try:
+        order = client.place_order(
+            OrderRequest(
+                key=key,
+                side=Side.BUY,
+                quantity=result.quantity,
+                type=OrderType.MARKET,
+                product=Product.CNC,
+                time_in_force=TimeInForce.DAY,
+                tag=ORDER_TAG,
+            )
         )
-    )
+    except UnknownOutcomeError as exc:
+        # The buy may be live at Upstox. Count it against today's limit so the
+        # next run cannot blindly buy again.
+        tracker.record_trade(key)
+        db.save_daily_state(RISK_STATE_KEY, tracker.snapshot())
+        report_unknown_outcome(journal, run_id, key, "entry", exc)
+        raise
     tracker.record_trade(key)
     # Neither write is fatal: the order is already at the broker, and the
     # next run reconciles from there. What's lost is a row, not money.
@@ -252,17 +277,21 @@ def handle_exit(
     """Close the whole position on a death cross."""
     sig = Signal(key=key, kind=SignalKind.EXIT_LONG, at=dt.datetime.now(dt.UTC), price=last.close, strategy=STRATEGY_NAME)
 
-    order = client.place_order(
-        OrderRequest(
-            key=key,
-            side=Side.SELL,
-            quantity=held,
-            type=OrderType.MARKET,
-            product=Product.CNC,
-            time_in_force=TimeInForce.DAY,
-            tag=ORDER_TAG,
+    try:
+        order = client.place_order(
+            OrderRequest(
+                key=key,
+                side=Side.SELL,
+                quantity=held,
+                type=OrderType.MARKET,
+                product=Product.CNC,
+                time_in_force=TimeInForce.DAY,
+                tag=ORDER_TAG,
+            )
         )
-    )
+    except UnknownOutcomeError as exc:
+        report_unknown_outcome(journal, run_id, key, "exit", exc)
+        raise
 
     try:
         db.record_fill(sig, order, run_id=run_id, paper=False)
